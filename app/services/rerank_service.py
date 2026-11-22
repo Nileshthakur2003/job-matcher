@@ -75,7 +75,8 @@ async def rerank_documents(
             logger.warning(f"FlashRank reranking failed: {e}. Falling back to heuristic.")
 
     # Option 3: Fallback based on pre-computed RRF score
-    sorted_docs = sorted(documents, key=lambda x: x.get("rrf_score", 0.0), reverse=True)
+    sorted_docs = sorted(documents, key=lambda x: (x.get("rrf_score") or 0.0), reverse=True)
     for doc in sorted_docs:
-        doc["rerank_score"] = round(doc.get("rrf_score", 0.5) * 100, 2)
+        rrf = doc.get("rrf_score")
+        doc["rerank_score"] = round((rrf if rrf is not None else 0.5) * 100, 2)
     return sorted_docs[:top_n]

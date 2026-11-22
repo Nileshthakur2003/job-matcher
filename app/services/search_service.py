@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from typing import Any, Dict, List, Optional
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,7 +66,9 @@ async def generate_fit_explanation(candidate: CandidateProfile, job_title: str, 
                 max_tokens=60,
                 temperature=0.3,
             )
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content and content.strip():
+                return content.strip()
         except Exception as e:
             logger.warning(f"Fit explanation generation failed: {e}")
 
@@ -94,37 +97,48 @@ async def hybrid_search_jobs(
 
     query_embedding = await get_single_embedding(search_query)
 
-    keywords = list(candidate.skills[:6]) + candidate.target_roles[:2]
+    # Sanitize keywords for full text search (remove punctuation that could break tsquery)
+    raw_keywords = list(candidate.skills[:6]) + candidate.target_roles[:2]
     if user_preferences:
-        keywords.extend(user_preferences.split()[:4])
-    keyword_str = " ".join([k.replace("'", "") for k in keywords if len(k) > 1]) or "Software Engineer"
+        raw_keywords.extend(user_preferences.split()[:4])
 
-    filters = []
+    sanitized_words = [re.sub(r"[^\w]", "", k) for k in raw_keywords]
+    keyword_str = " ".join([w for w in sanitized_words if len(w) > 1]) or "Software Engineer"
+
+    filters = [Job.embedding.isnot(None)]
     if candidate.is_remote_only:
         filters.append(Job.is_remote == True)
 
     if candidate.seniority_level == "intern" or (user_preferences and "intern" in user_preferences.lower()):
         filters.append(Job.role_type == "internship")
 
-    # Dense Search
-    dense_stmt = (
-        select(Job, Job.embedding.cosine_distance(query_embedding).label("distance"))
-        .where(*filters)
-        .order_by(Job.embedding.cosine_distance(query_embedding))
-        .limit(50)
-    )
-    dense_results = (await db.execute(dense_stmt)).all()
+    try:
+        # Dense Search
+        dense_stmt = (
+            select(Job, Job.embedding.cosine_distance(query_embedding).label("distance"))
+            .where(*filters)
+            .order_by(Job.embedding.cosine_distance(query_embedding))
+            .limit(50)
+        )
+        dense_results = (await db.execute(dense_stmt)).all()
+    except Exception as e:
+        logger.warning(f"Dense search query failed: {e}")
+        dense_results = []
 
-    # Sparse BM25 Search
-    sparse_query = func.websearch_to_tsquery("english", keyword_str)
-    sparse_stmt = (
-        select(Job, func.ts_rank_cd(Job.search_vector, sparse_query).label("rank"))
-        .where(*filters)
-        .where(Job.search_vector.op("@@")(sparse_query))
-        .order_by(desc("rank"))
-        .limit(50)
-    )
-    sparse_results = (await db.execute(sparse_stmt)).all()
+    try:
+        # Sparse BM25 Search
+        sparse_query = func.websearch_to_tsquery("english", keyword_str)
+        sparse_stmt = (
+            select(Job, func.ts_rank_cd(Job.search_vector, sparse_query).label("rank"))
+            .where(*filters)
+            .where(Job.search_vector.op("@@")(sparse_query))
+            .order_by(desc("rank"))
+            .limit(50)
+        )
+        sparse_results = (await db.execute(sparse_stmt)).all()
+    except Exception as e:
+        logger.warning(f"Sparse search query failed: {e}")
+        sparse_results = []
 
     # Reciprocal Rank Fusion (RRF)
     K = 60
