@@ -7,8 +7,9 @@ python-multipart>=0.0.9
 pydantic>=2.6.4
 pydantic-settings>=2.2.1
 
-# Database & ORM
-sqlalchemy>=2.0.28
+# Database & ORM (Async SQLAlchemy requires greenlet)
+sqlalchemy[asyncio]>=2.0.28
+greenlet>=3.0.3
 asyncpg>=0.29.0
 pgvector>=0.2.5
 
