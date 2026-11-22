@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Central application settings managed via Pydantic v2."""
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/jobmatcher"
@@ -11,7 +12,7 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4o-mini"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     COHERE_API_KEY: str = ""
-    
+
     HOST: str = "0.0.0.0"
     PORT: int = int(os.environ.get("PORT", 8000))
     APP_ENV: str = "development"
@@ -19,9 +20,9 @@ class Settings(BaseSettings):
     @property
     def sanitized_database_url(self) -> str:
         """
-        Normalizes connection strings from Neon, Supabase, or Railway:
-        1. Converts 'postgres://' or 'postgresql://' to 'postgresql+asyncpg://'
-        2. Strips 'sslmode' query params which conflict with asyncpg kwargs.
+        Normalizes connection strings from Neon, Supabase, or Render:
+        - Converts 'postgres://' or 'postgresql://' to 'postgresql+asyncpg://'
+        - Strips 'sslmode' query params which conflict with asyncpg kwargs.
         """
         url = self.DATABASE_URL.strip()
         if url.startswith("postgres://"):

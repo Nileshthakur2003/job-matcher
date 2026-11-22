@@ -4,7 +4,7 @@ import math
 from typing import List, Optional
 from openai import AsyncOpenAI
 
-from app.config import settings
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,6 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
 
     if client:
         try:
-            # Clean and truncate inputs to avoid token overflow
             cleaned_texts = [t.replace("\n", " ").strip()[:8000] for t in texts]
             response = await client.embeddings.create(
                 model=settings.EMBEDDING_MODEL,
@@ -40,27 +39,24 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
         except Exception as e:
             logger.error(f"OpenAI embedding generation failed: {e}. Falling back to deterministic vector.")
 
-    # Offline / Mock Fallback: 1536-dimensional deterministic pseudo-embedding
     return [_generate_pseudo_embedding(t) for t in texts]
 
 
 async def get_single_embedding(text: str) -> List[float]:
-    """Helper for a single text embedding."""
+    """Helper generating embedding for a single text."""
     results = await get_embeddings([text])
     return results[0]
 
 
 def _generate_pseudo_embedding(text: str, dim: int = 1536) -> List[float]:
-    """Generates a deterministic unit-length vector from text hash for offline testing."""
+    """Generates a deterministic unit-length vector from text hash for zero-cost offline testing."""
     vec = []
-    # Seed values based on MD5 and SHA256 hashes of text
     h = hashlib.sha256(text.encode("utf-8")).digest()
     for i in range(dim):
         byte_val = h[i % len(h)]
         val = (byte_val / 128.0) - 1.0 + math.sin(i + (byte_val % 7))
         vec.append(val)
 
-    # Normalize to unit length (L2 norm = 1.0)
     norm = math.sqrt(sum(x * x for x in vec))
     if norm > 0:
         vec = [x / norm for x in vec]

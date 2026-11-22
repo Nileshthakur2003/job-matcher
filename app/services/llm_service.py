@@ -1,20 +1,21 @@
 import logging
 import re
-from typing import Type, TypeVar, Optional
-from pydantic import BaseModel
+from typing import Optional, Type, TypeVar
 from openai import AsyncOpenAI
+from pydantic import BaseModel
 
-from app.config import settings
-from app.schemas import JobNormalizationOutput, CandidateProfile
+from app.core.config import settings
+from app.schemas.candidate import CandidateProfile
+from app.schemas.job import JobNormalizationOutput
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
-
 _client: Optional[AsyncOpenAI] = None
 
 
 def get_openai_client() -> Optional[AsyncOpenAI]:
+    """Retrieves or instantiates the OpenAI async client."""
     global _client
     if _client is None and settings.OPENAI_API_KEY:
         _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -29,7 +30,7 @@ async def extract_structured_data(
 ) -> T:
     """
     Extract structured data using OpenAI Structured Outputs (Pydantic).
-    Falls back to heuristic extraction if OPENAI_API_KEY is not set.
+    Falls back to heuristic NLP extraction if OPENAI_API_KEY is not set or fails.
     """
     client = get_openai_client()
 
@@ -50,7 +51,6 @@ async def extract_structured_data(
         except Exception as e:
             logger.warning(f"OpenAI structured output call failed: {e}. Falling back to heuristic.")
 
-    # Fallback heuristic parser if API key is not configured or fails
     if response_model == JobNormalizationOutput:
         return _fallback_normalize_job(user_prompt)  # type: ignore
     elif response_model == CandidateProfile:
@@ -63,10 +63,8 @@ def _fallback_normalize_job(raw_text: str) -> JobNormalizationOutput:
     """Heuristic fallback for job normalization when running offline or without an API key."""
     text_lower = raw_text.lower()
 
-    # Remote detection
     is_remote = any(k in text_lower for k in ["remote", "work from home", "anywhere", "wfh", "distributed"])
 
-    # Role type detection
     role_type = "full-time"
     if any(k in text_lower for k in ["intern", "internship", "co-op"]):
         role_type = "internship"
@@ -75,7 +73,6 @@ def _fallback_normalize_job(raw_text: str) -> JobNormalizationOutput:
     elif "part-time" in text_lower:
         role_type = "part-time"
 
-    # Common technical skill keywords
     known_skills = [
         "Python", "FastAPI", "PostgreSQL", "pgvector", "Docker", "Kubernetes", "AWS",
         "GCP", "PyTorch", "TensorFlow", "React", "Next.js", "TypeScript", "JavaScript",
@@ -86,7 +83,6 @@ def _fallback_normalize_job(raw_text: str) -> JobNormalizationOutput:
     if not extracted_skills:
         extracted_skills = ["Software Engineering", "Python", "Backend"]
 
-    # Seniority level
     seniority = "mid"
     if any(k in text_lower for k in ["senior", "sr.", "lead", "principal", "staff"]):
         seniority = "senior"

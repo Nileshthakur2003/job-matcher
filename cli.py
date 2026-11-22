@@ -1,13 +1,16 @@
+import argparse
 import asyncio
 import logging
 import time
 from typing import List
-from app.db import AsyncSessionLocal, init_db
-from app.schemas import CandidateProfile
-from app.search import search_and_rank_jobs
+
+from app.core.database import AsyncSessionLocal, init_db
+from app.schemas.candidate import CandidateProfile
+from app.services.ingest_service import execute_ingestion
+from app.services.search_service import search_and_rank_jobs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("eval")
+logger = logging.getLogger("cli")
 
 SAMPLE_PROFILES: List[CandidateProfile] = [
     CandidateProfile(
@@ -58,7 +61,8 @@ SAMPLE_PROFILES: List[CandidateProfile] = [
 ]
 
 
-async def run_evaluation():
+async def run_benchmark():
+    """Runs latency and relevance benchmarks across 5 synthetic candidate profiles."""
     logger.info("Initializing DB connection for evaluation...")
     await init_db()
 
@@ -98,5 +102,31 @@ async def run_evaluation():
     print("=" * 90 + "\n")
 
 
+def main():
+    parser = argparse.ArgumentParser(description="AI Job Matcher CLI Tool")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Ingest command
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest job listings into pgvector")
+    ingest_parser.add_argument("--source", type=str, default="all", choices=["all", "greenhouse", "remoteok", "seed"])
+    ingest_parser.add_argument("--limit", type=int, default=100)
+
+    # Eval command
+    subparsers.add_parser("eval", help="Run retrieval latency and relevance benchmark")
+
+    # Init DB command
+    subparsers.add_parser("init-db", help="Initialize PostgreSQL schema, vector extension, and triggers")
+
+    args = parser.parse_args()
+
+    if args.command == "ingest":
+        asyncio.run(execute_ingestion(source=args.source, limit=args.limit))
+    elif args.command == "eval":
+        asyncio.run(run_benchmark())
+    elif args.command == "init-db":
+        asyncio.run(init_db())
+        print("Database schema and extensions initialized successfully.")
+
+
 if __name__ == "__main__":
-    asyncio.run(run_evaluation())
+    main()

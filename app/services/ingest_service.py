@@ -1,56 +1,38 @@
-import argparse
 import asyncio
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 import httpx
 from sqlalchemy.dialects.postgresql import insert
 
-from app.db import AsyncSessionLocal, Job, init_db
-from app.schemas import JobNormalizationOutput
-from app.services.embedding import get_embeddings
-from app.services.llm import extract_structured_data
+from app.core.database import AsyncSessionLocal, init_db
+from app.models.job import Job
+from app.schemas.job import JobNormalizationOutput
+from app.services.embedding_service import get_embeddings
+from app.services.llm_service import extract_structured_data
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("ingest")
+logger = logging.getLogger("ingest_service")
 
-# Known public greenhouse company boards with active listings
 GREENHOUSE_COMPANIES = [
-    "anthropic",
-    "cloudflare",
-    "github",
-    "stripe",
-    "canonical",
-    "gitlab",
-    "elastic",
-    "datadog",
-    "reddit",
-    "automattic",
+    "anthropic", "cloudflare", "github", "stripe",
+    "canonical", "gitlab", "elastic", "datadog", "reddit", "automattic"
 ]
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def clean_html(raw_html: str) -> str:
-    """Strip HTML tags and unescape common entities."""
     clean_text = HTML_TAG_RE.sub(" ", raw_html)
-    clean_text = (
-        clean_text.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", '"')
-    )
+    for k, v in [("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"')]:
+        clean_text = clean_text.replace(k, v)
     return " ".join(clean_text.split())
 
 
 async def fetch_greenhouse_jobs(client: httpx.AsyncClient, company: str, limit_per_company: int = 40) -> List[Dict[str, Any]]:
-    """Fetch live jobs from Greenhouse public job board API."""
     url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs?content=true"
     try:
         resp = await client.get(url, timeout=12.0)
         if resp.status_code != 200:
-            logger.warning(f"Greenhouse board for '{company}' returned HTTP {resp.status_code}")
             return []
         data = resp.json()
         raw_jobs = data.get("jobs", [])[:limit_per_company]
@@ -74,16 +56,14 @@ async def fetch_greenhouse_jobs(client: httpx.AsyncClient, company: str, limit_p
 
 
 async def fetch_remoteok_jobs(client: httpx.AsyncClient, limit: int = 100) -> List[Dict[str, Any]]:
-    """Fetch live tech jobs from RemoteOK public API."""
     url = "https://remoteok.com/api"
     try:
-        headers = {"User-Agent": "AIJobMatcherBot/1.0 (Academic & Proof of Work Project)"}
+        headers = {"User-Agent": "AIJobMatcherBot/1.0 (Proof of Work Project)"}
         resp = await client.get(url, headers=headers, timeout=15.0)
         if resp.status_code != 200:
             return []
         data = resp.json()
         jobs = []
-        # first item in RemoteOK is legal notice
         for item in data[1:limit + 1]:
             if not isinstance(item, dict):
                 continue
@@ -104,7 +84,6 @@ async def fetch_remoteok_jobs(client: httpx.AsyncClient, limit: int = 100) -> Li
 
 
 def generate_seed_dataset(count: int = 50) -> List[Dict[str, Any]]:
-    """Generate high-signal realistic seed jobs for instant offline testing and verification."""
     roles = [
         ("AI Engineer", "Develop LLM applications, RAG pipelines, pgvector search, and fine-tuning with Python, LangChain, and FastAPI."),
         ("Senior Backend Engineer", "Build distributed microservices with async Python, PostgreSQL, Redis, Docker, and Kafka on AWS."),
@@ -113,10 +92,9 @@ def generate_seed_dataset(count: int = 50) -> List[Dict[str, Any]]:
         ("AI Software Engineer Intern", "Assist in training evaluation pipelines, dataset curation, and building RAG workflows in Python and PyTorch."),
         ("Data Engineer", "Build high-throughput data processing pipelines using Spark, dbt, Snowflake, and PostgreSQL."),
         ("DevOps / MLOps Engineer", "Manage Kubernetes clusters, CI/CD with GitHub Actions, model observability with Prometheus, and Docker."),
-        ("NLP Research Scientist", "Conduct research on model distillation, cross-encoder rerankers, semantic search, and transformer architectures."),
     ]
-    companies = ["Scale AI", "OpenAI", "Anthropic", "Mistral", "Cohere", "Datadog", "Cloudflare", "Supabase", "Pinecone", "Vercel"]
-    locations = ["Remote", "San Francisco, CA", "New York, NY", "Seattle, WA", "Austin, TX"]
+    companies = ["Scale AI", "OpenAI", "Anthropic", "Mistral", "Cohere", "Datadog", "Cloudflare", "Supabase"]
+    locations = ["Remote", "San Francisco, CA", "New York, NY", "Seattle, WA"]
 
     jobs = []
     for i in range(count):
@@ -134,9 +112,6 @@ def generate_seed_dataset(count: int = 50) -> List[Dict[str, Any]]:
     return jobs
 
 
-# -------------------------------------------------------------
-# Normalization Pipeline
-# -------------------------------------------------------------
 SYSTEM_NORMALIZATION_PROMPT = """You are an expert AI talent recruiter.
 Your job is to analyze the job posting text and return a strictly structured JSON output:
 1. is_remote: Boolean (true if fully remote or remote-first)
@@ -150,7 +125,6 @@ sem = asyncio.Semaphore(10)
 
 
 async def normalize_single_job(raw_job: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a single job using LLM with Pydantic structured output."""
     async with sem:
         prompt = f"Title: {raw_job['title']}\nCompany: {raw_job['company']}\nLocation: {raw_job['location']}\n\nDescription:\n{raw_job['description'][:2000]}"
         output: JobNormalizationOutput = await extract_structured_data(
@@ -167,17 +141,12 @@ async def normalize_single_job(raw_job: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-# -------------------------------------------------------------
-# Upsert & Ingestion Orchestrator
-# -------------------------------------------------------------
 async def upsert_jobs_batch(jobs_with_embeddings: List[Dict[str, Any]]):
-    """Upsert normalized jobs into PostgreSQL with pgvector, deduplicating on apply_url."""
     if not jobs_with_embeddings:
         return
 
-    records = []
-    for j in jobs_with_embeddings:
-        records.append({
+    records = [
+        {
             "title": j["title"],
             "company": j["company"],
             "location": j.get("location", "Unknown"),
@@ -187,7 +156,9 @@ async def upsert_jobs_batch(jobs_with_embeddings: List[Dict[str, Any]]):
             "description": j["description"],
             "apply_url": j["apply_url"],
             "embedding": j["embedding"],
-        })
+        }
+        for j in jobs_with_embeddings
+    ]
 
     async with AsyncSessionLocal() as session:
         stmt = insert(Job).values(records)
@@ -209,13 +180,11 @@ async def upsert_jobs_batch(jobs_with_embeddings: List[Dict[str, Any]]):
     logger.info(f"Upserted batch of {len(records)} jobs into PostgreSQL.")
 
 
-async def run_ingestion(source: str = "all", limit: int = 500, use_seed_fallback: bool = True):
-    """Main ingestion coordinator."""
-    logger.info("Initializing database schema, pgvector, and search vector triggers...")
+async def execute_ingestion(source: str = "all", limit: int = 500, use_seed_fallback: bool = True):
+    """Coordinates full pipeline: fetch -> LLM normalize -> batch embed -> upsert."""
     await init_db()
 
     raw_jobs: List[Dict[str, Any]] = []
-
     async with httpx.AsyncClient() as client:
         if source in ("greenhouse", "all"):
             logger.info("Fetching jobs from Greenhouse boards...")
@@ -230,63 +199,35 @@ async def run_ingestion(source: str = "all", limit: int = 500, use_seed_fallback
             logger.info("Fetching jobs from RemoteOK...")
             remote_jobs = await fetch_remoteok_jobs(client, limit=limit - len(raw_jobs))
             raw_jobs.extend(remote_jobs)
-            logger.info(f"Fetched {len(remote_jobs)} jobs from RemoteOK.")
 
-    # Deduplicate raw jobs by apply_url before processing
     seen_urls = set()
-    deduped_raw: List[Dict[str, Any]] = []
-    for j in raw_jobs:
-        if j["apply_url"] not in seen_urls:
-            seen_urls.add(j["apply_url"])
-            deduped_raw.append(j)
+    deduped_raw = [j for j in raw_jobs if not (j["apply_url"] in seen_urls or seen_urls.add(j["apply_url"]))]
 
     if not deduped_raw and use_seed_fallback:
-        logger.info(f"No external jobs retrieved. Generating {limit} realistic seed jobs...")
+        logger.info(f"Generating {limit} realistic seed jobs...")
         deduped_raw = generate_seed_dataset(count=min(limit, 100))
 
     deduped_raw = deduped_raw[:limit]
-    logger.info(f"Total jobs to process & ingest: {len(deduped_raw)}")
+    logger.info(f"Total jobs to normalize & ingest: {len(deduped_raw)}")
 
-    # 1. Structured Normalization via LLM (with concurrent semaphore)
-    logger.info("Step 1/3: Normalizing job listings using Pydantic Structured Outputs...")
-    normalization_tasks = [normalize_single_job(j) for j in deduped_raw]
-    normalized_jobs = await asyncio.gather(*normalization_tasks)
+    normalized_jobs = await asyncio.gather(*[normalize_single_job(j) for j in deduped_raw])
 
-    # 2. Batch Embedding Generation
-    logger.info("Step 2/3: Generating 1536-dimensional vector embeddings...")
     embedding_texts = [
         f"Title: {j['title']}\nCompany: {j['company']}\nRole: {j['role_type']}\nRemote: {j['is_remote']}\nSkills: {', '.join(j['skills'])}\nSummary: {j['cleaned_summary']}"
         for j in normalized_jobs
     ]
 
-    # Process in chunks of 50 for embedding API
     batch_size = 50
     all_embeddings: List[List[float]] = []
     for i in range(0, len(embedding_texts), batch_size):
         chunk = embedding_texts[i : i + batch_size]
         chunk_embeddings = await get_embeddings(chunk)
         all_embeddings.extend(chunk_embeddings)
-        logger.info(f"Generated embeddings {len(all_embeddings)}/{len(embedding_texts)}")
 
     for j, emb in zip(normalized_jobs, all_embeddings):
         j["embedding"] = emb
 
-    # 3. Database Upsert
-    logger.info("Step 3/3: Upserting jobs into PostgreSQL...")
     for i in range(0, len(normalized_jobs), batch_size):
-        batch = normalized_jobs[i : i + batch_size]
-        await upsert_jobs_batch(batch)
+        await upsert_jobs_batch(normalized_jobs[i : i + batch_size])
 
-    logger.info(f"Ingestion complete! Successfully stored {len(normalized_jobs)} jobs in pgvector.")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest jobs into PostgreSQL with pgvector.")
-    parser.add_argument("--source", type=str, default="all", choices=["all", "greenhouse", "remoteok", "seed"], help="Data source")
-    parser.add_argument("--limit", type=int, default=500, help="Number of jobs to ingest")
-    args = parser.parse_args()
-
-    if args.source == "seed":
-        asyncio.run(run_ingestion(source="seed", limit=args.limit, use_seed_fallback=True))
-    else:
-        asyncio.run(run_ingestion(source=args.source, limit=args.limit))
+    logger.info(f"Ingestion complete! Stored {len(normalized_jobs)} jobs in pgvector.")
